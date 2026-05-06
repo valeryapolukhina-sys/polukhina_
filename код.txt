@@ -1,0 +1,542 @@
+/*
+ * УКДДС — Система учёта денежных средств
+ * Простой консольный интерфейс, C++17, без зависимостей
+ * Компиляция: g++ -std=c++17 -o ukdds main.cpp
+ */
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <iomanip>
+#include <termios.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+
+// ── ANSI коды ────────────────────────────────────────────────────────────────
+#define RST   "\033[0m"
+#define BOLD  "\033[1m"
+#define DIM   "\033[2m"
+#define RED   "\033[31m"
+#define GRN   "\033[32m"
+#define YLW   "\033[33m"
+#define BLU   "\033[34m"
+#define CYN   "\033[36m"
+#define WHT   "\033[37m"
+#define BBLK  "\033[90m"
+#define BRED  "\033[91m"
+#define BGRN  "\033[92m"
+#define BYLW  "\033[93m"
+#define BBLU  "\033[94m"
+#define BCYN  "\033[96m"
+#define BWHT  "\033[97m"
+#define BGBLU "\033[44m"
+#define BGBLK "\033[40m"
+#define BGDK  "\033[48;5;234m"
+
+inline std::string mv(int r, int c){
+    return "\033["+std::to_string(r)+";"+std::to_string(c)+"H";
+}
+#define CLR   "\033[2J\033[H"
+#define HCUR  "\033[?25l"
+#define SCUR  "\033[?25h"
+
+// ── Псевдографика ────────────────────────────────────────────────────────────
+#define HL "─"
+#define VL "│"
+#define TL "┌"
+#define TR "┐"
+#define BL "└"
+#define BR "┘"
+#define LJ "├"
+#define RJ "┤"
+
+// ── Терминал ─────────────────────────────────────────────────────────────────
+static struct termios _orig;
+void rawOn()  { struct termios t; tcgetattr(0,&_orig); t=_orig; t.c_lflag&=~(ECHO|ICANON); t.c_cc[VMIN]=1; tcsetattr(0,TCSAFLUSH,&t); }
+void rawOff() { tcsetattr(0,TCSAFLUSH,&_orig); }
+void tsize(int&r,int&c){ struct winsize w; ioctl(1,TIOCGWINSZ,&w); r=w.ws_row?w.ws_row:40; c=w.ws_col?w.ws_col:120; }
+
+enum Key { KENTER='\n', KCR='\r', KESC=27, KBS=127, KUP=256, KDN, KLT, KRT, KTAB='\t' };
+int getch(){
+    unsigned char c; if(read(0,&c,1)!=1)return -1;
+    if(c==27){ unsigned char s[2]; read(0,&s[0],1); read(0,&s[1],1);
+        if(s[0]=='['){
+            if(s[1]=='A') return KUP;
+            if(s[1]=='B') return KDN;
+            if(s[1]=='C') return KRT;
+            if(s[1]=='D') return KLT;
+        }
+        return KESC;
+    }
+    return c;
+}
+
+// ── Вспомогательные функции вывода ───────────────────────────────────────────
+void at(int r,int c){ std::cout<<mv(r,c); }
+
+void box(int r,int c,int h,int w,const char*clr=""){
+    std::string line; for(int i=0;i<w-2;i++)line+=HL;
+    std::cout<<clr; at(r,c); std::cout<<TL<<line<<TR;
+    for(int i=1;i<h-1;i++){ at(r+i,c);std::cout<<VL; at(r+i,c+w-1);std::cout<<VL; }
+    at(r+h-1,c); std::cout<<BL<<line<<BR; if(*clr)std::cout<<RST;
+}
+
+void fill(int r,int c,int h,int w,const char*bg){
+    std::string s(w-2,' ');
+    for(int i=1;i<h-1;i++){ at(r+i,c+1); std::cout<<bg<<s<<RST; }
+}
+
+void pr(int r,int c,const std::string&t,const char*clr=""){
+    at(r,c); if(*clr)std::cout<<clr; std::cout<<t; if(*clr)std::cout<<RST;
+}
+
+void hdiv(int r,int c,int w){
+    std::string s; s+=LJ; for(int i=0;i<w-2;i++)s+=HL; s+=RJ;
+    at(r,c); std::cout<<BBLK<<s<<RST;
+}
+
+void btn(int r,int c,const std::string&lbl,bool act=true){
+    at(r,c);
+    if(act) std::cout<<BGBLU<<BWHT<<BOLD<<" "<<lbl<<" "<<RST;
+    else    std::cout<<BGDK <<BWHT     <<" "<<lbl<<" "<<RST;
+}
+
+void field(int r,int c,int w,const std::string&val,bool focus,bool pwd=false){
+    std::string d=pwd?std::string(val.size(),'*'):val;
+    d.resize(w,' '); at(r,c);
+    if(focus) std::cout<<"\033[47m"<<"\033[30m"<<d<<RST;
+    else      std::cout<<BGDK<<BWHT<<d<<RST;
+}
+
+void append(std::string&s,int k,int max=48){
+    if(k==KBS){ if(!s.empty())s.pop_back(); }
+    else if(k>=32&&k<256&&(int)s.size()<max) s+=(char)k;
+}
+
+// ── Состояние приложения ─────────────────────────────────────────────────────
+enum Screen { LOGIN, DASH, OPS, ACCS, REPS, REFS, NEWOP, BUDGETS, SETT };
+
+struct App {
+    Screen scr = LOGIN;
+    std::string user = "";
+    std::string lUser="", lPass="";
+    int lFld=0;
+    std::string msg="";
+    int opPage=1, budRow=0, settTab=0;
+    bool run=true;
+};
+
+// ── Боковое меню ─────────────────────────────────────────────────────────────
+struct NI { const char*lbl; Screen scr; };
+const NI NAV[]={{"Главная",DASH},{"Операции",OPS},{"Счета",ACCS},
+                {"Отчёты",REPS},{"Справочники",REFS},
+                {"Бюджеты",BUDGETS},{"Настройки",SETT}};
+const int NLEN=7;
+
+int sidebar(int rows, Screen cur){
+    const int W=16;
+    for(int r=2;r<=rows;r++){ at(r,1); std::cout<<BGDK<<std::string(W,' ')<<RST; }
+    pr(2,2, BCYN+std::string(BOLD)+"УКДДС"+RST, "");
+    for(int i=0;i<NLEN;i++){
+        at(4+i,1);
+        std::string lbl=" "; lbl+=NAV[i].lbl; lbl.resize(W,' ');
+        if(NAV[i].scr==cur) std::cout<<BGBLU<<BWHT<<BOLD<<lbl<<RST;
+        else                 std::cout<<BGDK <<BWHT     <<lbl<<RST;
+    }
+    at(rows,1); std::cout<<BGDK<<BWHT<<" Выход"<<std::string(W-7,' ')<<RST;
+    return W;
+}
+
+void header(int cols,const char*title,const std::string&user){
+    std::string bar(cols,' ');
+    at(1,1); std::cout<<BGBLU<<BWHT<<BOLD<<bar<<RST;
+    pr(1,2, std::string(BGBLU)+BWHT+BOLD+" УКДДС │ "+title+RST,"");
+    std::string info=" "+user+" ";
+    at(1,cols-(int)info.size()); std::cout<<BGBLU<<BWHT<<info<<RST;
+}
+
+// ── ЭКРАН: ВХОД ──────────────────────────────────────────────────────────────
+void showLogin(App&a, int rows, int cols){
+    std::cout<<CLR;
+    for(int r=1;r<=rows;r++){ at(r,1); std::cout<<BGDK<<std::string(cols,' ')<<RST; }
+
+    int fw=36, fh=14;
+    int fr=(rows-fh)/2, fc=(cols-fw)/2;
+    box(fr,fc,fh,fw,BLU);
+    fill(fr,fc,fh,fw,BGDK);
+
+    pr(fr+1, fc+2, std::string(BCYN)+BOLD+"   Вход в систему"+RST,"");
+    hdiv(fr+2,fc,fw);
+
+    pr(fr+4, fc+2, std::string(BBLK)+"Логин:"+RST, "");
+    field(fr+5, fc+2, fw-4, a.lUser, a.lFld==0);
+
+    pr(fr+7, fc+2, std::string(BBLK)+"Пароль (необязательно):"+RST, "");
+    field(fr+8, fc+2, fw-4, a.lPass, a.lFld==1, true);
+
+    btn(fr+10, fc+(fw-9)/2, "Войти");
+
+    pr(fr+12, fc+2, std::string(BBLK)+"  (нажмите Enter для входа)"+RST,"");
+
+    if(!a.msg.empty()) pr(fr+fh-1, fc+2, std::string(BRED)+a.msg+RST,"");
+
+    at(rows,1); std::cout<<BBLK<<" [Tab] Следующее поле  [Enter] Войти  [Q] Выход"<<RST;
+}
+
+// ── ЭКРАН: ДАШБОРД ───────────────────────────────────────────────────────────
+void showDash(App&a, int rows, int cols){
+    std::cout<<CLR;
+    header(cols,"Главная",a.user);
+    int sw=sidebar(rows,DASH), x=sw+2, w=cols-sw-2;
+
+    pr(2,x, std::string(BWHT)+BOLD+"Добро пожаловать, "+RST+
+            BCYN+BOLD+a.user+"!"+RST, "");
+
+    int cw=(w-6)/3;
+    struct C{ const char*t; const char*v; const char*c; };
+    C cards[]={{"Общий баланс","1 250 000 ₽",BGRN},
+               {"Доходы (месяц)","+800 000 ₽",BGRN},
+               {"Расходы (месяц)","−300 000 ₽",BRED}};
+    for(int i=0;i<3;i++){
+        int r=4, c=x+i*(cw+2);
+        box(r,c,5,cw,BBLK); fill(r,c,5,cw,BGDK);
+        pr(r+1,c+2, std::string(BBLK)+cards[i].t+RST,"");
+        int vlen=(int)std::string(cards[i].v).size();
+        at(r+2,c+(cw-vlen)/2); std::cout<<cards[i].c<<BOLD<<cards[i].v<<RST;
+    }
+
+    int tr=10, th=rows-12;
+    box(tr,x,th,w,BBLK); fill(tr,x,th,w,BGDK);
+    pr(tr,x+2, std::string(BCYN)+" Последние операции"+RST,"");
+    at(tr+1,x+1); std::cout<<BGBLU<<BWHT<<BOLD;
+    std::string h=" Дата        Тип       Контрагент              Сумма       ";
+    h.resize(w-2,' '); std::cout<<h<<RST;
+    hdiv(tr+2,x,w);
+
+    struct Op{ const char*dt,*tp,*cn,*sm; bool p; };
+    Op ops[]={
+        {"04.05.2026","Доход",  "ООО \"Лотос\"",   "+ 50 000 ₽", true },
+        {"04.05.2026","Расход", "ООО \"Астра\"",    "− 25 000 ₽", false},
+        {"03.05.2026","Доход",  "ООО \"Сигма\"",    "+ 18 500 ₽", true },
+        {"03.05.2026","Расход", "ООО \"Бренд-арт\"","−100 000 ₽", false},
+        {"02.05.2026","Расход", "Коммерческий банк","−  1 800 ₽", false},
+        {"01.05.2026","Доход",  "ООО \"Омега\"",    "+200 000 ₽", true },
+    };
+    for(int i=0;i<6&&i<th-4;i++){
+        at(tr+3+i,x+1);
+        std::string bg=(i%2==0)?std::string(BGBLK):std::string(BGDK);
+        std::cout<<bg; printf(" %-12s %-9s %-24s",ops[i].dt,ops[i].tp,ops[i].cn); std::cout<<RST;
+        at(tr+3+i,x+50);
+        std::cout<<bg<<(ops[i].p?BGRN:BRED)<<std::setw(12)<<ops[i].sm<<RST;
+    }
+
+    at(rows,1); std::cout<<BBLK<<" [2] Операции  [3] Счета  [4] Отчёты  [5] Справочники  [6] Бюджеты  [7] Настройки  [Q] Выход"<<RST;
+}
+
+// ── ЭКРАН: ОПЕРАЦИИ ──────────────────────────────────────────────────────────
+void showOps(App&a, int rows, int cols){
+    std::cout<<CLR;
+    header(cols,"Операции",a.user);
+    int sw=sidebar(rows,OPS), x=sw+2, w=cols-sw-2;
+    pr(2,x, std::string(BCYN)+BOLD+"Операции"+RST,"");
+    btn(2,x+w-20,"+ Новая операция");
+
+    int tr=4;
+    box(tr,x,rows-6,w,BBLK); fill(tr,x,rows-6,w,BGDK);
+    at(tr+1,x+1); std::cout<<BGBLU<<BWHT<<BOLD;
+    std::string h=" Дата        Тип       Категория         Сумма         Описание          ";
+    h.resize(w-2,' '); std::cout<<h<<RST;
+    hdiv(tr+2,x,w);
+
+    struct R{ const char*dt,*tp,*cat,*sm,*ds; bool p; };
+    R rows2[]={
+        {"04.05.2026","Доход",  "Оплата услуг",  "+ 50 000 ₽","Счёт №91",           true},
+        {"04.05.2026","Расход", "Поставщик",     "− 25 000 ₽","Аренда офиса №2",    false},
+        {"03.05.2026","Доход",  "Оплата услуг",  "+ 18 500 ₽","Услуги по контракту", true},
+        {"03.05.2026","Расход", "Поставщик",     "−100 000 ₽","Аренда по счёту №3", false},
+        {"02.05.2026","Расход", "Комиссия банка","−  1 800 ₽","Обслуживание счёта",  false},
+        {"01.05.2026","Доход",  "Оплата услуг",  "+200 000 ₽","Доход за апрель",     true},
+        {"30.04.2026","Расход", "Налоги",        "− 45 000 ₽","НДС за Q1",           false},
+        {"29.04.2026","Доход",  "Оплата услуг",  "+ 12 000 ₽","Проект #14",           true},
+    };
+    int n=8, pg=a.opPage-1, start=pg*4, end=std::min(start+4,n);
+    for(int i=start;i<end;i++){
+        at(tr+3+(i-start),x+1);
+        std::string bg=((i-start)%2==0)?std::string(BGBLK):std::string(BGDK);
+        std::cout<<bg; printf(" %-12s %-9s %-18s",rows2[i].dt,rows2[i].tp,rows2[i].cat); std::cout<<RST;
+        at(tr+3+(i-start),x+42);
+        std::cout<<bg<<(rows2[i].p?BGRN:BRED)<<std::setw(12)<<rows2[i].sm<<RST;
+        at(tr+3+(i-start),x+56);
+        std::cout<<bg<<BBLK<<rows2[i].ds<<RST;
+    }
+    int pgr=tr+rows-10;
+    at(pgr,x+w/2-8); std::cout<<BGDK<<BWHT<<" < "<<RST<<"  ";
+    for(int p=1;p<=2;p++){
+        if(p==a.opPage) std::cout<<BGBLU<<BWHT<<BOLD<<" "<<p<<" "<<RST;
+        else            std::cout<<BGDK<<BWHT<<" "<<p<<" "<<RST;
+        std::cout<<" ";
+    }
+    std::cout<<BGDK<<BWHT<<" > "<<RST;
+
+    at(rows,1); std::cout<<BBLK<<" [N] Новая операция  [←→] Страница  [Q] Выход"<<RST;
+}
+
+// ── ЭКРАН: СЧЕТА ─────────────────────────────────────────────────────────────
+void showAccs(App&a, int rows, int cols){
+    std::cout<<CLR;
+    header(cols,"Счета",a.user);
+    int sw=sidebar(rows,ACCS), x=sw+2, w=cols-sw-2;
+    pr(2,x,std::string(BCYN)+BOLD+"Счета"+RST,"");
+    btn(2,x+w-16,"+ Новый счёт");
+
+    int tr=4;
+    box(tr,x,rows-6,w,BBLK); fill(tr,x,rows-6,w,BGDK);
+    at(tr+1,x+1); std::cout<<BGBLU<<BWHT<<BOLD;
+    std::string h=" Название счёта         Тип            Валюта    Баланс          ";
+    h.resize(w-2,' '); std::cout<<h<<RST;
+    hdiv(tr+2,x,w);
+
+    struct A2{ const char*nm,*tp,*cur,*bal; };
+    A2 accs[]={{"Расчётный счёт","Основной",     "RUB","850 000 ₽"},
+               {"Касса",         "Наличные",     "RUB"," 45 000 ₽"},
+               {"Валютный счёт", "Валютный",     "USD","  5 200 $"},
+               {"Депозит",       "Накопительный","RUB","200 000 ₽"}};
+    for(int i=0;i<4;i++){
+        at(tr+3+i,x+1);
+        std::string bg=(i%2==0)?std::string(BGBLK):std::string(BGDK);
+        std::cout<<bg; printf(" %-24s %-15s %-10s",accs[i].nm,accs[i].tp,accs[i].cur); std::cout<<RST;
+        at(tr+3+i,x+52); std::cout<<bg<<BGRN<<BOLD<<std::setw(14)<<accs[i].bal<<RST;
+    }
+    at(rows,1); std::cout<<BBLK<<" [↑↓] Выбрать  [Enter] Подробнее  [Q] Выход"<<RST;
+}
+
+// ── ЭКРАН: ОТЧЁТЫ ────────────────────────────────────────────────────────────
+void showReps(App&a, int rows, int cols){
+    std::cout<<CLR;
+    header(cols,"Отчёты",a.user);
+    int sw=sidebar(rows,REPS), x=sw+2, w=cols-sw-2;
+    pr(2,x,std::string(BCYN)+BOLD+"Отчёты"+RST,"");
+
+    int cw=(w-6)/4;
+    struct C2{ const char*t,*v,*c; };
+    C2 cards[]={{"Движение средств","550 000 ₽",BWHT},{"Доходы","+800 000 ₽",BGRN},
+                {"Расходы","−250 000 ₽",BRED},{"Остаток","1 100 000 ₽",BGRN}};
+    for(int i=0;i<4;i++){
+        int r=4,c=x+i*(cw+1);
+        box(r,c,4,cw,BBLK); fill(r,c,4,cw,BGDK);
+        pr(r+1,c+1,std::string(BBLK)+cards[i].t+RST,"");
+        int vl=(int)std::string(cards[i].v).size();
+        at(r+2,c+(cw-vl)/2); std::cout<<cards[i].c<<BOLD<<cards[i].v<<RST;
+    }
+
+    int chr=9, chh=rows-12, chw=w;
+    box(chr,x,chh,chw,BBLK); fill(chr,x,chh,chw,BGDK);
+    pr(chr,x+2,std::string(BCYN)+" Доходы и расходы по месяцам"+RST,"");
+    pr(chr+1,x+2,std::string(BGBLU)+BWHT+"  "+RST+" доходы   "+BGBLK+"\033[41m"+"  "+RST+" расходы","");
+
+    struct Bar{ const char*m; int inc,exp; };
+    Bar bars[]={{"Янв",70,30},{"Фев",50,40},{"Мар",80,50},{"Апр",65,45},{"Май",90,35}};
+    int maxH=chh-5, bspc=(chw-4)/(int)(sizeof(bars)/sizeof(bars[0]));
+    for(int i=0;i<5;i++){
+        int cc=x+2+i*bspc;
+        int ih=bars[i].inc*maxH/100, eh=bars[i].exp*maxH/100;
+        for(int j=0;j<ih;j++){ at(chr+maxH-j+2,cc);   std::cout<<BGBLU<<"  "<<RST; }
+        for(int j=0;j<eh;j++){ at(chr+maxH-j+2,cc+3); std::cout<<"\033[41m""  "<<RST; }
+        at(chr+maxH+3,cc); std::cout<<BBLK<<bars[i].m<<RST;
+    }
+    btn(rows-2,x+w-20,"Экспорт в Excel");
+    at(rows,1); std::cout<<BBLK<<" [E] Экспорт  [Q] Выход"<<RST;
+}
+
+// ── ЭКРАН: СПРАВОЧНИКИ ───────────────────────────────────────────────────────
+void showRefs(App&a, int rows, int cols){
+    std::cout<<CLR;
+    header(cols,"Справочники",a.user);
+    int sw=sidebar(rows,REFS), x=sw+2, w=cols-sw-2;
+    pr(2,x,std::string(BCYN)+BOLD+"Справочники — Контрагенты"+RST,"");
+    btn(2,x+w-22,"+ Добавить контрагента");
+
+    int tr=4;
+    box(tr,x,rows-6,w,BBLK); fill(tr,x,rows-6,w,BGDK);
+    at(tr+1,x+1); std::cout<<BGBLU<<BWHT<<BOLD;
+    std::string h=" Наименование           ИНН          Тип            Телефон          ";
+    h.resize(w-2,' '); std::cout<<h<<RST;
+    hdiv(tr+2,x,w);
+
+    struct Ref{ const char*nm,*inn,*tp,*ph; };
+    Ref refs[]={{"ООО \"Лотос\"",  "7710123456","Клиент",      "+7(495)123-45-56"},
+                {"ООО \"Омега\"",  "7722334455","Поставщик",   "+7(495)322-22-23"},
+                {"ООО \"Сигма\"",  "7733445566","Поставщик",   "+7(495)343-23-35"},
+                {"ИП Иванов И.И.","7700123456","Арендодатель", "+7(495)444-44-44"}};
+    for(int i=0;i<4;i++){
+        at(tr+3+i,x+1);
+        std::string bg=(i%2==0)?std::string(BGBLK):std::string(BGDK);
+        std::cout<<bg; printf(" %-23s %-13s %-15s %-18s",refs[i].nm,refs[i].inn,refs[i].tp,refs[i].ph); std::cout<<RST;
+    }
+    at(rows,1); std::cout<<BBLK<<" [N] Добавить  [↑↓] Выбрать  [Q] Выход"<<RST;
+}
+
+// ── ЭКРАН: НОВАЯ ОПЕРАЦИЯ ────────────────────────────────────────────────────
+void showNewOp(App&a, int rows, int cols){
+    std::cout<<CLR;
+    header(cols,"Новая операция",a.user);
+    int sw=sidebar(rows,OPS), x=sw+2, w=cols-sw-2;
+
+    int fw=std::min(w-4,55), fh=20, fr=3, fc=x+(w-fw)/2;
+    box(fr,fc,fh,fw,BLU); fill(fr,fc,fh,fw,BGDK);
+    pr(fr+1,fc+2,std::string(BCYN)+BOLD+" Новая операция"+RST,"");
+    hdiv(fr+2,fc,fw);
+
+    at(fr+3,fc+2); std::cout<<BBLK<<"Тип:"<<RST<<"  ";
+    std::cout<<BGBLU<<BWHT<<BOLD<<" Доход "<<RST<<"  "<<BGDK<<BWHT<<" Расход "<<RST<<"  "<<BGDK<<BWHT<<" Перевод "<<RST;
+
+    const char*lbls[]={"Дата:","Сумма (₽):","Категория:","Контрагент:","Счёт:"};
+    const char*vals[]={"04.05.2026","","Оплата услуг","ООО \"Лотос\"","Расчётный счёт"};
+    for(int i=0;i<5;i++){
+        pr(fr+5+i*2, fc+2, std::string(BBLK)+lbls[i]+RST,"");
+        field(fr+6+i*2, fc+2, fw-4, vals[i], i==1);
+    }
+    pr(fr+15,fc+2,std::string(BBLK)+"Описание:"+RST,"");
+    field(fr+16,fc+2,fw-4,"",false);
+    hdiv(fr+17,fc,fw);
+    btn(fr+18,fc+(fw-12)/2-2,"Сохранить");
+    at(fr+18,fc+(fw-12)/2+10); std::cout<<BGDK<<BWHT<<" Отмена "<<RST;
+
+    at(rows,1); std::cout<<BBLK<<" [Enter] Сохранить  [Esc] Отмена  [Q] Выход"<<RST;
+}
+
+// ── ЭКРАН: БЮДЖЕТЫ ───────────────────────────────────────────────────────────
+void showBudgets(App&a, int rows, int cols){
+    std::cout<<CLR;
+    header(cols,"Бюджеты и лимиты",a.user);
+    int sw=sidebar(rows,BUDGETS), x=sw+2, w=cols-sw-2;
+    pr(2,x,std::string(BCYN)+BOLD+"Бюджеты и лимиты"+RST,"");
+    btn(2,x+w-18,"+ Новый бюджет");
+
+    int tr=4;
+    box(tr,x,rows-6,w,BBLK); fill(tr,x,rows-6,w,BGDK);
+    at(tr+1,x+1); std::cout<<BGBLU<<BWHT<<BOLD;
+    std::string h=" Категория              Лимит         Использовано    Статус      ";
+    h.resize(w-2,' '); std::cout<<h<<RST;
+    hdiv(tr+2,x,w);
+
+    struct Bud{ const char*cat,*lim,*used,*st; int pct; bool warn; };
+    Bud buds[]={{"Маркетинг",   "100 000 ₽"," 80 000 ₽","В норме",    80,false},
+                {"Аренда",      "100 000 ₽","100 000 ₽","Исчерпан",  100,true },
+                {"Командировки"," 80 000 ₽"," 62 000 ₽","В норме",    77,false},
+                {"Хоз. расходы"," 50 000 ₽"," 30 000 ₽","Превышение",110,true }};
+    int bw=w-70;
+    for(int i=0;i<4;i++){
+        bool sel=(i==a.budRow);
+        at(tr+3+i,x+1);
+        std::string bg=sel?std::string(BGBLU):((i%2==0)?std::string(BGBLK):std::string(BGDK));
+        std::cout<<bg; printf(" %-23s %-14s %-17s",buds[i].cat,buds[i].lim,buds[i].used); std::cout<<RST;
+        at(tr+3+i,x+57);
+        const char*sc=(buds[i].pct>=110)?BYLW:(buds[i].pct>=100)?BRED:BGRN;
+        std::cout<<bg<<sc<<buds[i].st<<RST;
+        at(tr+3+i,x+70);
+        int fl=bw*std::min(buds[i].pct,100)/100;
+        const char*bc=(buds[i].pct>=100)?"\033[41m":(buds[i].pct>=80)?"\033[43m":"\033[42m";
+        std::cout<<bc<<std::string(fl,' ')<<RST<<BGDK<<std::string(bw-fl,' ')<<RST;
+        std::cout<<BBLK<<" "<<buds[i].pct<<"%"<<RST;
+    }
+    at(rows,1); std::cout<<BBLK<<" [N] Новый  [↑↓] Выбрать  [Enter] Редактировать  [Q] Выход"<<RST;
+}
+
+// ── ЭКРАН: НАСТРОЙКИ ─────────────────────────────────────────────────────────
+void showSett(App&a, int rows, int cols){
+    std::cout<<CLR;
+    header(cols,"Настройки",a.user);
+    int sw=sidebar(rows,SETT), x=sw+2, w=cols-sw-2;
+    pr(2,x,std::string(BCYN)+BOLD+"Настройки — Пользователи"+RST,"");
+    btn(2,x+w-22,"+ Добавить пользователя");
+
+    int tr=4;
+    box(tr,x,rows-6,w,BBLK); fill(tr,x,rows-6,w,BGDK);
+    at(tr+1,x+1); std::cout<<BGBLU<<BWHT<<BOLD;
+    std::string h=" ФИО                    Логин        Роль               Email                  Статус  ";
+    h.resize(w-2,' '); std::cout<<h<<RST;
+    hdiv(tr+2,x,w);
+
+    struct U{ const char*nm,*lg,*rl,*em,*st; };
+    U users[]={{"Иванов И.И.",  "ivanov", "Администратор","ivanov@mail.ru", "Активен"},
+               {"Петров П.П.",  "petrov", "Бухгалтер",    "petrov@mail.ru", "Активен"},
+               {"Сидоров С.С.","sidorov", "Руководитель", "sidorov@mail.ru","Активен"}};
+    for(int i=0;i<3;i++){
+        at(tr+3+i,x+1);
+        std::string bg=(i%2==0)?std::string(BGBLK):std::string(BGDK);
+        std::cout<<bg; printf(" %-23s %-13s %-19s %-23s",users[i].nm,users[i].lg,users[i].rl,users[i].em); std::cout<<RST;
+        at(tr+3+i,x+81); std::cout<<bg<<BGRN<<users[i].st<<RST;
+    }
+    at(rows,1); std::cout<<BBLK<<" [N] Добавить  [↑↓] Выбрать  [Q] Выход"<<RST;
+}
+
+// ── ОБРАБОТКА ВВОДА ──────────────────────────────────────────────────────────
+void handleLogin(App&a, int k){
+    switch(k){
+        case KTAB:  a.lFld=(a.lFld+1)%2; break;
+        case KENTER: case KCR:
+            a.user=a.lUser.empty()?"Пользователь":a.lUser;
+            a.scr=DASH; a.msg="";
+            break;
+        case 'q': case 'Q': case KESC: a.run=false; break;
+        default:
+            if(a.lFld==0) append(a.lUser,k);
+            else          append(a.lPass,k);
+            a.msg="";
+    }
+}
+
+void handleMain(App&a, int k){
+    if(k=='q'||k=='Q')  { a.run=false; return; }
+    if(k==KESC)         { a.scr=LOGIN; return; }
+    if(k=='1') a.scr=DASH;
+    if(k=='2') a.scr=OPS;
+    if(k=='3') a.scr=ACCS;
+    if(k=='4') a.scr=REPS;
+    if(k=='5') a.scr=REFS;
+    if(k=='6') a.scr=BUDGETS;
+    if(k=='7') a.scr=SETT;
+    if((k=='n'||k=='N')&&(a.scr==OPS||a.scr==DASH)) a.scr=NEWOP;
+    if(k==KLT&&a.scr==OPS&&a.opPage>1) a.opPage--;
+    if(k==KRT&&a.scr==OPS&&a.opPage<2) a.opPage++;
+    if(k==KUP&&a.scr==BUDGETS&&a.budRow>0) a.budRow--;
+    if(k==KDN&&a.scr==BUDGETS&&a.budRow<3) a.budRow++;
+}
+
+// ── MAIN ─────────────────────────────────────────────────────────────────────
+int main(){
+    int rows,cols; tsize(rows,cols);
+    if(rows<24) rows=24;
+    if(cols<80) cols=80;
+    rawOn();
+    std::cout<<HCUR;
+
+    App a;
+    while(a.run){
+        tsize(rows,cols);
+        if(rows<24) rows=24;
+        if(cols<80) cols=80;
+        switch(a.scr){
+            case LOGIN:   showLogin(a,rows,cols);   break;
+            case DASH:    showDash(a,rows,cols);    break;
+            case OPS:     showOps(a,rows,cols);     break;
+            case ACCS:    showAccs(a,rows,cols);    break;
+            case REPS:    showReps(a,rows,cols);    break;
+            case REFS:    showRefs(a,rows,cols);    break;
+            case NEWOP:   showNewOp(a,rows,cols);   break;
+            case BUDGETS: showBudgets(a,rows,cols); break;
+            case SETT:    showSett(a,rows,cols);    break;
+        }
+        std::cout.flush();
+        int k=getch();
+        if(a.scr==LOGIN)         handleLogin(a,k);
+        else if(a.scr==NEWOP){ if(k==KESC||k=='q'||k=='Q')a.scr=OPS; }
+        else                     handleMain(a,k);
+    }
+
+    std::cout<<SCUR<<CLR;
+    rawOff();
+    std::cout<<"До свидания!\n";
+    return 0;
+}
